@@ -14,6 +14,7 @@
 # =========
 
 import time
+from functools import wraps
 from typing import Any, Callable, ClassVar, Dict, List, Optional, cast
 
 from camel.logger import get_logger
@@ -27,6 +28,159 @@ from .config_loader import ConfigLoader
 from .ws_wrapper import WebSocketBrowserWrapper
 
 logger = get_logger(__name__)
+
+
+def agent_reflection_wrapper(func):
+    """Decorator that prompts the agent to reflect and potentially change the
+    action."""
+
+    @wraps(func)
+    async def wrapper(self, *args, **kwargs):
+        # Get the action name from the function
+        action_name = (
+            func.__name__.replace('browser_', '').replace('_', ' ').title()
+        )
+
+        func_name = func.__name__
+
+        # Skip reflection for simple tool calls
+        simple_actions = [
+            "browser_open",
+            "browser_close",
+            "browser_get_page_snapshot",
+            "browser_back",
+            "browser_forward",
+            "browser_enter",
+            "browser_get_tab_info",
+        ]
+
+        if func_name in simple_actions:
+            logger.info(
+                "⚡ Skipping reflection for %s (simple action)", action_name
+            )
+            return await func(self, *args, **kwargs)
+
+        if hasattr(self, 'agent') and self.agent is not None:
+            logger.info(
+                "🧹 Clearing agent conversation history before %s", action_name
+            )
+            self.agent.reset()
+        # Create a reflection prompt that encourages re-evaluation
+        reflection_prompt = f"""
+You are about to execute the browser action '{action_name}' with these 
+parameters: {args}, {kwargs}
+
+Before proceeding, let's reflect on this decision:
+
+1. **Reasoning**: Why did you choose this specific action and parameters?
+2. **Next Goal**: What other actions could you take instead? Why is this one 
+better?
+
+After reflection, provide your final decision in this EXACT format:
+```json
+{{
+    "should_proceed": true/false,
+    "action": "browser_action_name",
+    "parameters": {{"param1": "value1", "param2": "value2"}},
+    "reasoning": "Your refined reasoning after reflection"
+}}
+```
+
+IMPORTANT: If you want to change the action, you MUST use one of these EXACT 
+action names with their required parameters:
+
+Actions with NO parameters (use parameters: {{}}):
+- browser_open
+- browser_close
+- browser_back
+- browser_forward
+- browser_get_page_snapshot
+- browser_enter
+- browser_get_tab_info
+- browser_console_view
+
+Actions with required parameters:
+- browser_visit_page → parameters: {{"url": "string"}}
+- browser_click → parameters: {{"ref": "string"}}
+- browser_type → parameters: {{"ref": "string", "text": "string"}} OR 
+  {{"inputs": [{{"ref": "string", "text": "string"}}]}}
+- browser_select → parameters: {{"ref": "string", "value": "string"}}
+- browser_scroll → parameters: {{"direction": "string", "amount": number}}
+- browser_mouse_control → parameters: {{"control": "string", "x": number, 
+  "y": number}}
+- browser_mouse_drag → parameters: {{"from_ref": "string", "to_ref": "string"}}
+- browser_press_key → parameters: {{"keys": ["string"]}}
+- browser_switch_tab → parameters: {{"tab_id": "string"}}
+- browser_close_tab → parameters: {{"tab_id": "string"}}
+- browser_console_exec → parameters: {{"code": "string"}}
+
+CRITICAL: Use the EXACT parameter names shown above (lowercase). For actions 
+with no parameters, use parameters: {{}} (empty object).
+IMPORTANT: If you set "should_proceed" to false, you MUST choose a DIFFERENT 
+action that would be more appropriate for the situation. Do not repeat the 
+same action.
+
+"""
+        # If we have an agent registered, prompt it for reflection
+        if hasattr(self, 'agent') and self.agent is not None:
+            try:
+                message = BaseMessage.make_user_message(
+                    role_name="User",
+                    content=reflection_prompt,
+                )
+
+                # Get the agent's reflection
+                response = await self.agent.astep(message)
+                agent_reflection = response.msgs[0].content
+
+                logger.info("Agent reflection for %s:", action_name)
+                logger.info("Reflection: %s", agent_reflection)
+
+                # Parse the reflection for action change
+                reflection_data = self._parse_reflection_for_action_change(
+                    agent_reflection
+                )
+
+                if reflection_data and not reflection_data.get(
+                    "should_proceed", True
+                ):
+                    # Agent wants to change the action
+                    new_action = reflection_data.get("action")
+                    new_params = reflection_data.get("parameters", {})
+
+                    logger.info(
+                        "Agent wants to change action from %s to %s",
+                        func.__name__,
+                        new_action,
+                    )
+
+                    # Execute the new action instead
+                    result = await self._execute_new_action(
+                        new_action, new_params
+                    )
+
+                    # Return only the clean action result without reflection
+                    # metadata
+                    return result
+
+            except Exception as e:
+                logger.warning(
+                    "Failed to get agent reflection for %s: %s", action_name, e
+                )
+                agent_reflection = f"Failed to get agent reflection: {e}"
+        else:
+            logger.info(
+                "No agent registered for reflection prompt in %s", action_name
+            )
+            agent_reflection = "No agent registered - proceeding with action"
+
+        # Execute the original function
+        result = await func(self, *args, **kwargs)
+
+        # Return only the clean action result without reflection metadata
+        return result
+
+    return wrapper
 
 
 class HybridBrowserToolkit(BaseToolkit, RegisteredAgentToolkit):
@@ -300,6 +454,7 @@ class HybridBrowserToolkit(BaseToolkit, RegisteredAgentToolkit):
         """Get the cache directory."""
         return self._cache_dir
 
+    @agent_reflection_wrapper
     async def browser_open(self) -> Dict[str, Any]:
         r"""Starts a new browser session. This must be the first browser
         action.
@@ -347,6 +502,7 @@ class HybridBrowserToolkit(BaseToolkit, RegisteredAgentToolkit):
                 "total_tabs": 0,
             }
 
+    @agent_reflection_wrapper
     async def browser_close(self) -> str:
         r"""Closes the browser session, releasing all resources.
 
@@ -389,6 +545,7 @@ class HybridBrowserToolkit(BaseToolkit, RegisteredAgentToolkit):
             logger.error(f"Failed to disconnect WebSocket: {e}")
             return f"Error disconnecting WebSocket: {e}"
 
+    @agent_reflection_wrapper
     async def browser_visit_page(self, url: str) -> Dict[str, Any]:
         r"""Opens a URL in a new browser tab and switches to it.
 
@@ -435,6 +592,7 @@ class HybridBrowserToolkit(BaseToolkit, RegisteredAgentToolkit):
                 "total_tabs": 0,
             }
 
+    @agent_reflection_wrapper
     async def browser_back(self) -> Dict[str, Any]:
         r"""Goes back to the previous page in the browser history.
 
@@ -480,6 +638,7 @@ class HybridBrowserToolkit(BaseToolkit, RegisteredAgentToolkit):
                 "total_tabs": 0,
             }
 
+    @agent_reflection_wrapper
     async def browser_forward(self) -> Dict[str, Any]:
         r"""Goes forward to the next page in the browser history.
 
@@ -525,6 +684,7 @@ class HybridBrowserToolkit(BaseToolkit, RegisteredAgentToolkit):
                 "total_tabs": 0,
             }
 
+    @agent_reflection_wrapper
     async def browser_get_page_snapshot(self) -> str:
         r"""Gets a textual snapshot of the page's interactive elements.
 
@@ -552,6 +712,7 @@ class HybridBrowserToolkit(BaseToolkit, RegisteredAgentToolkit):
             return f"Error capturing snapshot: {e}"
 
     @dependencies_required('PIL')
+    @agent_reflection_wrapper
     async def browser_get_som_screenshot(
         self,
         read_image: bool = True,
@@ -664,6 +825,7 @@ class HybridBrowserToolkit(BaseToolkit, RegisteredAgentToolkit):
             logger.error(f"Failed to get screenshot: {e}")
             return f"Error capturing screenshot: {e}"
 
+    @agent_reflection_wrapper
     async def browser_click(self, *, ref: str) -> Dict[str, Any]:
         r"""Performs a click on an element on the page.
 
@@ -719,6 +881,7 @@ class HybridBrowserToolkit(BaseToolkit, RegisteredAgentToolkit):
                 "total_tabs": 0,
             }
 
+    @agent_reflection_wrapper
     async def browser_type(
         self,
         *,
@@ -794,6 +957,7 @@ class HybridBrowserToolkit(BaseToolkit, RegisteredAgentToolkit):
                 "total_tabs": 0,
             }
 
+    @agent_reflection_wrapper
     async def browser_select(self, *, ref: str, value: str) -> Dict[str, Any]:
         r"""Selects an option in a dropdown (`<select>`) element.
 
@@ -842,6 +1006,7 @@ class HybridBrowserToolkit(BaseToolkit, RegisteredAgentToolkit):
                 "total_tabs": 0,
             }
 
+    @agent_reflection_wrapper
     async def browser_scroll(
         self, *, direction: str, amount: int = 500
     ) -> Dict[str, Any]:
@@ -890,6 +1055,7 @@ class HybridBrowserToolkit(BaseToolkit, RegisteredAgentToolkit):
                 "total_tabs": 0,
             }
 
+    @agent_reflection_wrapper
     async def browser_enter(self) -> Dict[str, Any]:
         r"""Simulates pressing the Enter key on the currently focused
         element.
@@ -937,6 +1103,7 @@ class HybridBrowserToolkit(BaseToolkit, RegisteredAgentToolkit):
                 "total_tabs": 0,
             }
 
+    @agent_reflection_wrapper
     async def browser_mouse_control(
         self, *, control: str, x: float, y: float
     ) -> Dict[str, Any]:
@@ -988,6 +1155,7 @@ class HybridBrowserToolkit(BaseToolkit, RegisteredAgentToolkit):
                 "total_tabs": 0,
             }
 
+    @agent_reflection_wrapper
     async def browser_mouse_drag(
         self, *, from_ref: str, to_ref: str
     ) -> Dict[str, Any]:
@@ -1036,6 +1204,7 @@ class HybridBrowserToolkit(BaseToolkit, RegisteredAgentToolkit):
                 "total_tabs": 0,
             }
 
+    @agent_reflection_wrapper
     async def browser_press_key(self, *, keys: List[str]) -> Dict[str, Any]:
         r"""Press key and key combinations.
         Supports single key press or combination of keys by concatenating
@@ -1084,6 +1253,7 @@ class HybridBrowserToolkit(BaseToolkit, RegisteredAgentToolkit):
                 "total_tabs": 0,
             }
 
+    @agent_reflection_wrapper
     async def browser_switch_tab(self, *, tab_id: str) -> Dict[str, Any]:
         r"""Switches to a different browser tab using its ID.
 
@@ -1132,6 +1302,7 @@ class HybridBrowserToolkit(BaseToolkit, RegisteredAgentToolkit):
                 "total_tabs": 0,
             }
 
+    @agent_reflection_wrapper
     async def browser_close_tab(self, *, tab_id: str) -> Dict[str, Any]:
         r"""Closes a browser tab using its ID.
 
@@ -1181,6 +1352,7 @@ class HybridBrowserToolkit(BaseToolkit, RegisteredAgentToolkit):
                 "total_tabs": 0,
             }
 
+    @agent_reflection_wrapper
     async def browser_get_tab_info(self) -> Dict[str, Any]:
         r"""Gets a list of all open browser tabs and their information.
 
@@ -1221,6 +1393,7 @@ class HybridBrowserToolkit(BaseToolkit, RegisteredAgentToolkit):
                 "total_tabs": 0,
             }
 
+    @agent_reflection_wrapper
     async def browser_console_view(self) -> Dict[str, Any]:
         r"""View current page console logs.
 
@@ -1239,6 +1412,7 @@ class HybridBrowserToolkit(BaseToolkit, RegisteredAgentToolkit):
             logger.error(f"Failed to get console view: {e}")
             return {"console_messages": []}
 
+    @agent_reflection_wrapper
     async def browser_console_exec(self, code: str) -> Dict[str, Any]:
         r"""Execute javascript code in the console of the current page and get
         results.
@@ -1287,6 +1461,7 @@ class HybridBrowserToolkit(BaseToolkit, RegisteredAgentToolkit):
             }
 
     # Additional methods for backward compatibility
+    @agent_reflection_wrapper
     async def browser_wait_user(
         self, timeout_sec: Optional[float] = None
     ) -> Dict[str, Any]:
@@ -1466,3 +1641,95 @@ class HybridBrowserToolkit(BaseToolkit, RegisteredAgentToolkit):
 
         logger.info(f"Returning {len(enabled_tools)} enabled tools")
         return enabled_tools
+
+    def _parse_reflection_for_action_change(
+        self, reflection_content: str
+    ) -> Optional[Dict[str, Any]]:
+        """Parse reflection content to extract action change information."""
+        import json
+        import re
+
+        try:
+            # Try to extract JSON from the reflection
+            json_match = re.search(
+                r'```json\s*(\{.*?\})\s*```', reflection_content, re.DOTALL
+            )
+            if json_match:
+                json_str = json_match.group(1)
+                return json.loads(json_str)
+
+            # Fallback: look for JSON anywhere in the content
+            json_start = reflection_content.find('{')
+            json_end = reflection_content.rfind('}') + 1
+            if json_start != -1 and json_end > json_start:
+                json_str = reflection_content[json_start:json_end]
+                return json.loads(json_str)
+
+            return None
+        except (json.JSONDecodeError, AttributeError) as e:
+            logger.warning(f"Failed to parse reflection JSON: {e}")
+            return None
+
+    async def _execute_new_action(
+        self, action_name: str, parameters: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Execute a different browser action based on reflection."""
+
+        # Map of available actions
+        action_map = {
+            "browser_open": self.browser_open,
+            "browser_close": self.browser_close,
+            "browser_visit_page": self.browser_visit_page,
+            "browser_back": self.browser_back,
+            "browser_forward": self.browser_forward,
+            "browser_get_page_snapshot": self.browser_get_page_snapshot,
+            "browser_get_som_screenshot": self.browser_get_som_screenshot,
+            "browser_click": self.browser_click,
+            "browser_type": self.browser_type,
+            "browser_select": self.browser_select,
+            "browser_scroll": self.browser_scroll,
+            "browser_enter": self.browser_enter,
+            "browser_mouse_control": self.browser_mouse_control,
+            "browser_mouse_drag": self.browser_mouse_drag,
+            "browser_press_key": self.browser_press_key,
+            "browser_switch_tab": self.browser_switch_tab,
+            "browser_close_tab": self.browser_close_tab,
+            "browser_get_tab_info": self.browser_get_tab_info,
+            "browser_console_view": self.browser_console_view,
+            "browser_console_exec": self.browser_console_exec,
+        }
+
+        if action_name not in action_map:
+            logger.error(f"Unknown action requested: {action_name}")
+            return {
+                "result": f"Error: Unknown action '{action_name}' requested",
+                "snapshot": "",
+                "tabs": [],
+                "current_tab": 0,
+                "total_tabs": 0,
+            }
+
+        try:
+            # Execute the new action with the new parameters
+            action_func = action_map[action_name]
+            result = await action_func(**parameters)
+
+            logger.info(
+                f"Successfully executed changed action: {action_name} "
+                f"with params: {parameters}"
+            )
+            return result
+
+        except Exception as e:
+            logger.error(
+                f"Failed to execute changed action {action_name}: {e}"
+            )
+            return {
+                "result": (
+                    f"Error executing changed action '{action_name}': {e}"
+                ),
+                "snapshot": "",
+                "tabs": [],
+                "current_tab": 0,
+                "total_tabs": 0,
+            }
