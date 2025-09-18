@@ -158,7 +158,7 @@ async def quick_test(num_tasks: int = 3):
     # Load dataset
     dataset_path = Path(
         "/Users/waleedalzarooni/Desktop/CAMEL PR's/Browser_research/"
-        "browser-action-wrapper/camel/WebVoyager_data.jsonl"
+        "browser_action_wrapper_fresh/camel/WebVoyager_data.jsonl"
     )
     tasks = []
 
@@ -247,22 +247,11 @@ Do not ask "What would you like to do next?" - instead, continue working until t
         minimal_logger.start_task(i, task['ques'])
 
         try:
-            # Create specific, actionable task prompt (following hybrid pattern)  # noqa: E501
+            # Simplified, non-redundant task prompt:
             task_prompt = f"""
-Use the browser to complete this task: {task['ques']}
+Complete this task: {task['ques']}
 
-Website: {task['web']}
-
-You must:
-1. Navigate to {task['web']}
-2. Search for the requested information using the search functionality
-3. Click on relevant results to find the specific details
-4. Extract all the information requested
-5. Provide a complete answer with all the details found
-
-Continue working through all steps until you have found 
-and can provide the complete answer.
-Do not stop after one action.  
+Target website: {task['web']}
 """
 
             # Provide task context to the planning model

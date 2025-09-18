@@ -2705,6 +2705,10 @@ class HybridBrowserToolkit(BaseToolkit, RegisteredAgentToolkit):
     ) -> Dict[str, Any]:
         """Execute alternative tool with parameters from planning model."""
 
+        logger.info(
+            f"🔄 ALTERNATIVE ACTION: Starting execution of '{action_name}' "
+            f"with params: {parameters}"
+        )
         # Set flag to bypass planning for alternative actions
         self._executing_alternative = True
 
@@ -2746,8 +2750,31 @@ class HybridBrowserToolkit(BaseToolkit, RegisteredAgentToolkit):
                     "total_tabs": 0,
                 }
 
+            logger.info(
+                f"✅ ALTERNATIVE ACTION: Found method for '{action_name}', "
+                f"executing..."
+            )
+
             # Execute with provided parameters (bypasses planning due to flag)
-            return await func(**parameters)
+            result = await func(**parameters)
+
+            # Add metadata to help the agent understand what happened
+            if isinstance(result, dict):
+                result["_alternative_action_executed"] = True
+                result["_alternative_action_name"] = action_name
+                result["_alternative_parameters"] = parameters
+                result["_message"] = (
+                    f"Alternative action '{action_name}' was executed "
+                    f"instead of the original action"
+                )
+                result["_success"] = True
+
+            logger.info(
+                f"✅ ALTERNATIVE ACTION: Successfully executed "
+                f"'{action_name}', result: {str(result)[:200]}..."
+            )
+            return result
+
         except Exception as e:
             return {
                 "result": f"Error executing action '{action_name}': {e!s}",
@@ -2759,6 +2786,10 @@ class HybridBrowserToolkit(BaseToolkit, RegisteredAgentToolkit):
         finally:
             # Always clear the flag when done
             self._executing_alternative = False
+            logger.info(
+                f"🔄 ALTERNATIVE ACTION: Completed '{action_name}', "
+                f"flag cleared"
+            )
 
     def set_task_context(self, context: str) -> None:
         self._current_task_context = context
