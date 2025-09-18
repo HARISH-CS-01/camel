@@ -22,6 +22,7 @@ from functools import wraps
 from typing import Any, Callable, ClassVar, Dict, List, Optional, cast
 
 from camel.logger import get_logger
+from camel.messages import BaseMessage
 from camel.models import BaseModelBackend
 from camel.toolkits.base import BaseToolkit, RegisteredAgentToolkit
 from camel.toolkits.function_tool import FunctionTool
@@ -33,6 +34,215 @@ from .browser_session import HybridBrowserSession
 from .config_loader import ConfigLoader
 
 logger = get_logger(__name__)
+
+
+def _serialize_parameters(args, kwargs):
+    """Safely convert function parameters to strings for planning prompt."""
+    safe_args = []
+    for arg in args:
+        try:
+            safe_args.append(str(arg))
+        except Exception:
+            safe_args.append(f"<non-serializable: {type(arg).__name__}>")
+
+    safe_kwargs = {}
+    for key, value in kwargs.items():
+        try:
+            safe_kwargs[key] = str(value)
+        except Exception:
+            safe_kwargs[key] = f"<non-serializable: {type(value).__name__}>"
+
+    return safe_args, safe_kwargs
+
+
+def _update_action_history(self, action_name):
+    """Track recent actions for loop detection."""
+    self._recent_actions.append(action_name)
+    if len(self._recent_actions) > 5:  # Keep only last 5 actions
+        self._recent_actions.pop(0)
+    return ", ".join(self._recent_actions[-3:])  # Show last 3 actions
+
+
+def _build_planning_prompt(
+    action_name, safe_args, safe_kwargs, recent_actions_str, task_context
+):
+    """Build the planning prompt for the external model."""
+    return (
+        "You are a strategic browser automation planning assistant. "
+        "Your job is to prevent the agent from getting stuck in loops "
+        "and ensure efficient progress toward goals.\n\n"
+        f"📋 CURRENT SITUATION:\n"
+        f"Action: {action_name}\n"
+        f"Parameters: {safe_args}, {safe_kwargs}\n"
+        f"Task: {task_context}\n"
+        f"Recent actions: {recent_actions_str}\n\n"
+        "🎯 STRATEGIC EVALUATION CRITERIA:\n"
+        "1. PROGRESS: Will this action move us closer to the goal?\n"
+        "2. LOOP DETECTION: Are we repeating actions without progress?\n"
+        "3. ALTERNATIVES: Would a different approach be better?\n\n"
+        "🚨 LOOP DETECTION RULES:\n"
+        "- 3+ consecutive identical actions = LIKELY LOOP\n"
+        "- Same action type 4+ times in recent history = STUCK\n"
+        "📝 REQUIRED RESPONSE FORMAT:\n"
+        "```json\n{\n"
+        "  \"should_proceed\": true/false,\n"
+        "  \"confidence\": 0.0-1.0,\n"
+        "  \"reasoning\": \"Clear explanation of decision\",\n"
+        "  \"suggested_alternative\": \"browser_action_name\" or null,\n"
+        "  \"alternative_parameters\": {\"param1\": \"value1\", "
+        "\"param2\": \"value2\"} or null\n"
+        "}\n```\n\n"
+        "🔧 AVAILABLE ACTIONS AND THEIR PARAMETERS:\n"
+        "No parameters: browser_open, browser_close, browser_back, "
+        "browser_forward, browser_get_page_snapshot, browser_enter, "
+        "browser_get_tab_info, browser_console_view\n"
+        "With parameters:\n"
+        "- browser_visit_page: {\"url\": \"string\"}\n"
+        "- browser_click: {\"ref\": \"string\"}\n"
+        "- browser_type: {\"ref\": \"string\", \"text\": \"string\"}\n"
+        "- browser_scroll: {\"direction\": \"down/up\", \"amount\": 500}\n"
+        "- browser_select: {\"ref\": \"string\", \"value\": \"string\"}\n"
+        "- browser_press_key: {\"keys\": [\"Enter\", \"Tab\"]}\n"
+        "- browser_console_exec: {\"code\": \"console.log('debug')\"}\n"
+        "- browser_mouse_control: {\"control\": \"click/right_click/dblclick\", "  # noqa: E501
+        "\"x\": 100, \"y\": 200}\n"
+        "- browser_mouse_drag: {\"from_ref\": \"string\", \"to_ref\": \"string\"}\n"  # noqa: E501
+        "- browser_switch_tab: {\"tab_id\": \"string\"}\n"
+        "- browser_close_tab: {\"tab_id\": \"string\"}\n"
+        "- browser_get_page_links: {\"ref\": [\"string1\", \"string2\"]}\n\n"
+        "⚡ DECISION GUIDELINES:\n"
+        "- PROCEED if action makes clear progress toward goal\n"
+        "- SUGGEST ALTERNATIVE if agent appears stuck or inefficient\n"
+        "- Be AGGRESSIVE about preventing loops - better to try alternatives "
+        "than repeat failed actions\n"
+        "- When suggesting alternatives, provide appropriate parameters "
+        "for the new action"
+    )
+
+
+async def _get_planning_response(self, planning_prompt):
+    """Communicate with the planning model and extract response."""
+    msg = BaseMessage.make_user_message(
+        role_name="User", content=planning_prompt
+    )
+    # Convert BaseMessage to OpenAIMessage format (dictionary)
+    openai_msg = msg.to_openai_user_message()
+
+    response = await self._planning_model.arun([openai_msg])
+
+    # Safely extract the content
+    if hasattr(response, "choices") and response.choices:
+        return response.choices[0].message.content
+    else:
+        return str(response)
+
+
+def _process_planning_result(self, planning_text, func_name):
+    """Process the planning result and return alternative action if needed."""
+    planning = (
+        self._parse_planning_result(planning_text)
+        if hasattr(self, "_parse_planning_result")
+        else None
+    )
+
+    if not planning:
+        return None
+
+    should_proceed = planning.get("should_proceed", True)
+
+    if should_proceed:
+        return None
+
+    alt = planning.get("suggested_alternative")
+    alt_params = planning.get("alternative_parameters", {})
+
+    if (
+        alt
+        and alt != func_name
+        and hasattr(self, "_execute_alternative_action")
+    ):
+        return alt, alt_params
+
+    return None
+
+
+def pre_planning_wrapper(func):
+    """Pre-action planning using external, tool-less model to avoid loops."""
+
+    @wraps(func)
+    async def wrapper(self, *args, **kwargs):
+        action_name = (
+            func.__name__.replace('browser_', '').replace('_', ' ').title()
+        )
+        func_name = func.__name__
+
+        # Bypass for simple actions
+        simple_actions = [
+            "browser_open",
+            "browser_close",
+            "browser_get_page_snapshot",
+            "browser_back",
+            "browser_forward",
+            "browser_enter",
+            "browser_get_tab_info",
+        ]
+
+        if func_name in simple_actions:
+            return await func(self, *args, **kwargs)
+
+        # Bypass planning if we're executing an alternative action
+        if getattr(self, '_executing_alternative', False):
+            return await func(self, *args, **kwargs)
+
+        # Only plan if a planning model is supplied
+        if (
+            hasattr(self, "_planning_model")
+            and self._planning_model is not None
+        ):
+            try:
+                # Serialize parameters for planning prompt
+                safe_args, safe_kwargs = _serialize_parameters(args, kwargs)
+
+                # Update action history for loop detection
+                recent_actions_str = _update_action_history(self, action_name)
+
+                # Get task context
+                task_context = getattr(
+                    self, '_current_task_context', 'No context available'
+                )
+
+                # Build planning prompt
+                planning_prompt = _build_planning_prompt(
+                    action_name,
+                    safe_args,
+                    safe_kwargs,
+                    recent_actions_str,
+                    task_context,
+                )
+
+                # Get planning response
+                planning_text = await _get_planning_response(
+                    self, planning_prompt
+                )
+
+                # Process planning result
+                alternative = _process_planning_result(
+                    self, planning_text, func_name
+                )
+
+                if alternative:
+                    alt_name, alt_params = alternative
+                    return await self._execute_alternative_action(
+                        alt_name, alt_params
+                    )
+
+            except Exception:
+                # If planning fails, fall back to executing the original action
+                pass
+
+        return await func(self, *args, **kwargs)
+
+    return wrapper
 
 
 class HybridBrowserToolkit(BaseToolkit, RegisteredAgentToolkit):
@@ -92,6 +302,7 @@ class HybridBrowserToolkit(BaseToolkit, RegisteredAgentToolkit):
         user_data_dir: Optional[str] = None,
         stealth: bool = False,
         web_agent_model: Optional[BaseModelBackend] = None,
+        planning_model: Optional[BaseModelBackend] = None,
         cache_dir: Optional[str] = None,
         enabled_tools: Optional[List[str]] = None,
         browser_log_to_file: bool = False,
@@ -127,6 +338,10 @@ class HybridBrowserToolkit(BaseToolkit, RegisteredAgentToolkit):
                 backend to use for the high-level `solve_task` agent. This is
                 required only if you plan to use `solve_task`.
                 Defaults to `None`.
+            planning_model (Optional[BaseModelBackend]): Lightweight model used
+                for pre-action planning and validation. It has no tool access
+                and returns a JSON decision (proceed/alternative), avoiding
+                nested agent/tool loops. Defaults to `None`.
             cache_dir (str): The directory to store cached files, such as
                 screenshots. Defaults to `"tmp/"`.
             enabled_tools (Optional[List[str]]): List of tool names to
@@ -202,6 +417,14 @@ class HybridBrowserToolkit(BaseToolkit, RegisteredAgentToolkit):
         self._user_data_dir = user_data_dir
         self._stealth = stealth
         self._web_agent_model = web_agent_model
+        self._planning_model = planning_model
+        self._recent_actions: list[str] = []  # Track recent actions for loops
+        self._executing_alternative = (
+            False  # Flag to bypass planning for alternative actions
+        )
+        self._current_task_context: str | None = (
+            None  # Task context for planning
+        )
         self._cache_dir = cache_dir or "tmp/"
         self._browser_log_to_file = browser_log_to_file
         self._log_dir = log_dir
@@ -1128,6 +1351,7 @@ class HybridBrowserToolkit(BaseToolkit, RegisteredAgentToolkit):
 
     # Public API Methods
 
+    @pre_planning_wrapper
     async def browser_open(self) -> Dict[str, Any]:
         r"""Starts a new browser session. This must be the first browser
         action.
@@ -1210,6 +1434,7 @@ class HybridBrowserToolkit(BaseToolkit, RegisteredAgentToolkit):
         await self._session.close()
         return "Browser session closed."
 
+    @pre_planning_wrapper
     @action_logger
     async def browser_visit_page(self, url: str) -> Dict[str, Any]:
         r"""Opens a URL in a new browser tab and switches to it.
@@ -1564,6 +1789,7 @@ class HybridBrowserToolkit(BaseToolkit, RegisteredAgentToolkit):
 
         return text_result
 
+    @pre_planning_wrapper
     async def browser_click(self, *, ref: str) -> Dict[str, Any]:
         r"""Performs a click on an element on the page.
 
@@ -1608,6 +1834,7 @@ class HybridBrowserToolkit(BaseToolkit, RegisteredAgentToolkit):
 
         return result
 
+    @pre_planning_wrapper
     async def browser_type(self, *, ref: str, text: str) -> Dict[str, Any]:
         r"""Types text into an input element on the page.
 
@@ -1636,6 +1863,7 @@ class HybridBrowserToolkit(BaseToolkit, RegisteredAgentToolkit):
 
         return result
 
+    @pre_planning_wrapper
     async def browser_select(self, *, ref: str, value: str) -> Dict[str, Any]:
         r"""Selects an option in a dropdown (`<select>`) element.
 
@@ -1665,6 +1893,7 @@ class HybridBrowserToolkit(BaseToolkit, RegisteredAgentToolkit):
 
         return result
 
+    @pre_planning_wrapper
     async def browser_scroll(
         self, *, direction: str, amount: int
     ) -> Dict[str, Any]:
@@ -1699,6 +1928,7 @@ class HybridBrowserToolkit(BaseToolkit, RegisteredAgentToolkit):
 
         return result
 
+    @pre_planning_wrapper
     async def browser_enter(self) -> Dict[str, Any]:
         r"""Simulates pressing the Enter key on the currently focused
         element.
@@ -1726,6 +1956,7 @@ class HybridBrowserToolkit(BaseToolkit, RegisteredAgentToolkit):
 
         return result
 
+    @pre_planning_wrapper
     @action_logger
     async def browser_mouse_control(
         self, *, control: str, x: float, y: float
@@ -1765,6 +1996,7 @@ class HybridBrowserToolkit(BaseToolkit, RegisteredAgentToolkit):
 
         return result
 
+    @pre_planning_wrapper
     @action_logger
     async def browser_mouse_drag(
         self, *, from_ref: str, to_ref: str
@@ -1833,6 +2065,7 @@ class HybridBrowserToolkit(BaseToolkit, RegisteredAgentToolkit):
 
         return result
 
+    @pre_planning_wrapper
     @action_logger
     async def browser_press_key(self, *, keys: List[str]) -> Dict[str, Any]:
         r"""Press key and key combinations.
@@ -1869,6 +2102,7 @@ class HybridBrowserToolkit(BaseToolkit, RegisteredAgentToolkit):
 
         return result
 
+    @pre_planning_wrapper
     @action_logger
     async def browser_wait_user(
         self, timeout_sec: Optional[float] = None
@@ -1934,6 +2168,7 @@ class HybridBrowserToolkit(BaseToolkit, RegisteredAgentToolkit):
 
         return {"result": result_msg, "snapshot": snapshot, **tab_info}
 
+    @pre_planning_wrapper
     @action_logger
     async def browser_get_page_links(
         self, *, ref: List[str]
@@ -1966,6 +2201,7 @@ class HybridBrowserToolkit(BaseToolkit, RegisteredAgentToolkit):
 
         return {"links": links}
 
+    @pre_planning_wrapper
     @action_logger
     async def browser_solve_task(
         self, task_prompt: str, start_url: str, max_steps: int = 15
@@ -1996,6 +2232,7 @@ class HybridBrowserToolkit(BaseToolkit, RegisteredAgentToolkit):
         await agent.process_command(task_prompt, max_steps=max_steps)
         return "Task processing finished - see stdout for detailed trace."
 
+    @pre_planning_wrapper
     @action_logger
     async def browser_console_view(self) -> Dict[str, Any]:
         r"""View current page console logs.
@@ -2013,6 +2250,7 @@ class HybridBrowserToolkit(BaseToolkit, RegisteredAgentToolkit):
             logger.warning(f"Failed to retrieve logs: {e}")
             return {"console_messages": []}
 
+    @pre_planning_wrapper
     async def browser_console_exec(self, code: str) -> Dict[str, Any]:
         r"""Execute javascript code in the console of the current page and get
         results.
@@ -2219,6 +2457,7 @@ class HybridBrowserToolkit(BaseToolkit, RegisteredAgentToolkit):
             dom_content_loaded_timeout=self._dom_content_loaded_timeout,
         )
 
+    @pre_planning_wrapper
     @action_logger
     async def browser_switch_tab(self, *, tab_id: str) -> Dict[str, Any]:
         r"""Switches to a different browser tab using its ID.
@@ -2264,6 +2503,7 @@ class HybridBrowserToolkit(BaseToolkit, RegisteredAgentToolkit):
 
         return result
 
+    @pre_planning_wrapper
     @action_logger
     async def browser_close_tab(self, *, tab_id: str) -> Dict[str, Any]:
         r"""Closes a browser tab using its ID.
@@ -2315,6 +2555,7 @@ class HybridBrowserToolkit(BaseToolkit, RegisteredAgentToolkit):
 
         return result
 
+    @pre_planning_wrapper
     @action_logger
     async def browser_get_tab_info(self) -> Dict[str, Any]:
         r"""Gets a list of all open browser tabs and their information.
@@ -2388,3 +2629,141 @@ class HybridBrowserToolkit(BaseToolkit, RegisteredAgentToolkit):
 
         logger.info(f"Returning {len(enabled_tools)} enabled tools")
         return enabled_tools
+
+    def _extract_json_from_markdown(self, content: str) -> Optional[str]:
+        """Extract JSON from markdown code blocks (```json ... ```)."""
+        import re
+
+        pattern = r"```json\s*(\{.*?\})\s*```"
+        match = re.search(pattern, content, re.DOTALL)
+        return match.group(1) if match else None
+
+    def _extract_json_from_text(self, content: str) -> Optional[str]:
+        """Extract JSON from plain text by finding first { to last }."""
+        start = content.find("{")
+        if start == -1:
+            return None
+
+        end = content.rfind("}") + 1
+        if end <= start:
+            return None
+
+        return content[start:end]
+
+    def _parse_json_safely(self, json_str: str) -> Optional[Dict[str, Any]]:
+        """Safely parse JSON string and return dictionary or None."""
+        import json
+
+        try:
+            return json.loads(json_str)
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.warning(f"⚠️ JSON parsing failed: {e}")
+            return None
+
+    def _validate_planning_result(self, result: Dict[str, Any]) -> bool:
+        """Validate that the planning result has required fields."""
+        required_fields = ["should_proceed"]
+        return all(field in result for field in required_fields)
+
+    def _parse_planning_result(
+        self, planning_content: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Parse planning content to extract JSON decision from planning model.
+
+        Handles multiple formats:
+        1. Markdown code blocks: ```json {...} ```
+        2. Plain text with JSON: {...}
+
+        Returns:
+            Dict with planning decision or None if parsing fails
+        """
+        logger.info(f" Parsing planning content: {planning_content[:200]}...")
+
+        # Strategy 1: Try to extract from markdown code blocks
+        json_str = self._extract_json_from_markdown(planning_content)
+        if json_str:
+            logger.info(f"📋 Extracted JSON from markdown: {json_str}")
+            result = self._parse_json_safely(json_str)
+            if result and self._validate_planning_result(result):
+                return result
+
+        # Strategy 2: Try to extract from plain text
+        json_str = self._extract_json_from_text(planning_content)
+        if json_str:
+            logger.info(f" Extracted JSON from text: {json_str}")
+            result = self._parse_json_safely(json_str)
+            if result and self._validate_planning_result(result):
+                return result
+
+        # If all strategies fail
+        logger.warning("⚠️ No valid JSON found in planning content")
+        return None
+
+    async def _execute_alternative_action(
+        self, action_name: str, parameters: dict
+    ) -> Dict[str, Any]:
+        """Execute alternative tool with parameters from planning model."""
+
+        # Set flag to bypass planning for alternative actions
+        self._executing_alternative = True
+
+        try:
+            # Map action names to methods
+            action_map = {
+                "browser_open": self.browser_open,
+                "browser_close": self.browser_close,
+                "browser_visit_page": self.browser_visit_page,
+                "browser_back": self.browser_back,
+                "browser_forward": self.browser_forward,
+                "browser_get_page_snapshot": self.browser_get_page_snapshot,
+                "browser_get_som_screenshot": self.browser_get_som_screenshot,
+                "browser_click": self.browser_click,
+                "browser_type": self.browser_type,
+                "browser_select": self.browser_select,
+                "browser_scroll": self.browser_scroll,
+                "browser_enter": self.browser_enter,
+                "browser_mouse_control": self.browser_mouse_control,
+                "browser_mouse_drag": self.browser_mouse_drag,
+                "browser_press_key": self.browser_press_key,
+                "browser_wait_user": self.browser_wait_user,
+                "browser_get_page_links": self.browser_get_page_links,
+                "browser_solve_task": self.browser_solve_task,
+                "browser_switch_tab": self.browser_switch_tab,
+                "browser_close_tab": self.browser_close_tab,
+                "browser_get_tab_info": self.browser_get_tab_info,
+                "browser_console_view": self.browser_console_view,
+                "browser_console_exec": self.browser_console_exec,
+            }
+
+            func = action_map.get(action_name)
+            if func is None:
+                return {
+                    "result": f"Error: Unknown action '{action_name}'",
+                    "snapshot": "",
+                    "tabs": [],
+                    "current_tab": 0,
+                    "total_tabs": 0,
+                }
+
+            # Execute with provided parameters (bypasses planning due to flag)
+            return await func(**parameters)
+        except Exception as e:
+            return {
+                "result": f"Error executing action '{action_name}': {e!s}",
+                "snapshot": "",
+                "tabs": [],
+                "current_tab": 0,
+                "total_tabs": 0,
+            }
+        finally:
+            # Always clear the flag when done
+            self._executing_alternative = False
+
+    def set_task_context(self, context: str) -> None:
+        self._current_task_context = context
+
+    def clear_task_context(self) -> None:
+        """Clear the current task context and action history."""
+        self._current_task_context = None
+        self._recent_actions = []  # Reset action history for new task
